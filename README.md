@@ -1,4 +1,4 @@
-# MedMax
+# MedMax (Accepted to NeurIPS 2025)
 MedMax: Mixed-Modal Instruction Tuning for Training Biomedical Assistants
 
 [[Webpage](https://mint-medmax.github.io/)] [[Paper](https://arxiv.org/abs/2412.12661)] [[Train Dataset 🤗](https://huggingface.co/datasets/mint-medmax/medmax_data)] [[Eval Dataset 🤗](https://huggingface.co/datasets/mint-medmax/medmax_eval_data)] [[Model 🤗](https://huggingface.co/mint-medmax/medmax_7b)] [[Demo 🤗]](https://huggingface.co/spaces/mint-medmax/medmax-demo-v1.0)
