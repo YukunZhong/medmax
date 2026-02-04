@@ -129,6 +129,21 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 -m training.train --tra
 ```python
     CUDA_VISIBLE_DEVICES=1 python -m src.load_lora_and_merge --ckpt_path <path to output dir/checkpoint-number> --output_dir <path to the output dir for the merged model> --base_path <path to the Anole-7b-1.0-hf model>
 ```
+
+## Continual Learning Metrics (Seq LoRA)
+
+For sequential instruction-tuning experiments, maintain a task-by-stage accuracy matrix and compute ACC/Fgt using exact-match scores. After finishing stage *t*, evaluate all tasks and record a row in the matrix. The script below updates the matrix and reports stage metrics; once the final stage is complete, it also reports overall ACC/Fgt.
+
+```bash
+python -m evaluation.continual_eval \
+  --tasks "ScienceQA,TextVQA,ImageNet,GQA,VizWiz" \
+  --stage 1 \
+  --results_json <path_to_task_accuracy.json> \
+  --matrix_path evaluation/outputs/seq_lora_matrix.json \
+  --metrics_path evaluation/outputs/seq_lora_metrics_stage1.json
+```
+
+`results_json` should map task names to exact-match accuracies (e.g., `{ "ScienceQA": 0.62, "TextVQA": 0.48, ... }`). You can also pass `--predictions_dir` to compute exact match from per-task JSONL files containing `answer` and `generated_text` fields.
 6. Now, we have to convert the merged model to the chameleon's format so that we can use the original chameleon's [code](https://github.com/facebookresearch/chameleon) for inference. Run the following command:
 ```
     CUDA_VISIBLE_DEVICES=1 python -m src.bin_to_pth --trained_ckpt <path to the merged checkpoint> --original_ckpt <original Anole model in the chameleon's format> --new_ckpt <save folder with the chameleon's format>
