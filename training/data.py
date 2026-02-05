@@ -9,7 +9,10 @@ class TokenizedDataset(Dataset):
     def __init__(self, filepath, max_length=2048):
         self.tokenized_data = []
         with jsonlines.open(filepath) as reader:
-            self.tokenized_data.append(torch.tensor(obj['tokens'], dtype=torch.long)[:max_length])
+            for row_idx, obj in enumerate(reader):
+                if 'tokens' not in obj:
+                    raise KeyError(f"Missing required 'tokens' field in input data at row {row_idx}.")
+                self.tokenized_data.append(torch.tensor(obj['tokens'], dtype=torch.long)[:max_length])
 
     def __len__(self):
         return len(self.tokenized_data)

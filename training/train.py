@@ -45,8 +45,8 @@ def main():
         model.print_trainable_parameters()
         
     # Initialize the dataset
-    train_dataset = TokenizedDataset(args.train_data)
-    val_dataset = TokenizedDataset(args.val_data) if args.val_data != "" else None
+    train_dataset = TokenizedDataset(args.train_data, max_length=args.max_length)
+    val_dataset = TokenizedDataset(args.val_data, max_length=args.max_length) if args.val_data != "" else None
 
     # Define training arguments
     training_args = TrainingArguments(
