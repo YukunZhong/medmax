@@ -12,6 +12,7 @@ def parse_args():
     parser.add_argument('--output_dir', required=True, type=str, help="output directory")
 
     parser.add_argument('--resume', default=False, action='store_true', help='resume from the last checkpoint')         
+    parser.add_argument('--extend_vocab', default=False, action='store_true', help='extend vocabulary embeddings')
 
     parser.add_argument('--lora', default=False, action='store_true', help='lora finetuning')         
     parser.add_argument('--lora_r', type=int, default=16, help="lora r")         
