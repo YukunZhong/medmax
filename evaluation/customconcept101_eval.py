@@ -203,6 +203,8 @@ def run_single_concept_eval(
     sft=False,
     max_gen_len=60,
     max_concepts=None,
+    images_per_concept=4,
+    start_from=None,
 ):
     """
     For each concept:
@@ -219,9 +221,20 @@ def run_single_concept_eval(
     if max_concepts is not None:
         concepts = concepts[:max_concepts]
 
+    # ← 跳过 start_from 之前的概念
+    if start_from is not None:
+        concept_ids = [c["concept_id"] for c in concepts]
+        if start_from in concept_ids:
+            start_idx = concept_ids.index(start_from)
+            print(f"Skipping first {start_idx} concepts, starting from '{start_from}'")
+            concepts = concepts[start_idx:]
+        else:
+            print(f"[WARN] start_from='{start_from}' not found in concepts, running all.")
+
     for concept in tqdm(concepts, desc="Single-concept inference"):
         concept_id = concept["concept_id"]
         prompts = build_single_prompts(concept)
+        prompts = prompts[:images_per_concept]
         ref_images = concept["ref_images"]
 
         concept_ti_scores = []
@@ -350,6 +363,7 @@ def run_multi_concept_eval(
     sft=False,
     max_gen_len=60,
     max_concepts=None,
+    images_per_concept=4,
 ):
     """
     For each multi-concept group:
@@ -373,6 +387,7 @@ def run_multi_concept_eval(
         group_id = f"{c1['concept_id']}__x__{c2['concept_id']}"
 
         compose_prompts = build_multi_prompts(group)
+        compose_prompts = compose_prompts[:images_per_concept]
 
         group_ti_scores = []
         group_ii_c1_scores = []
@@ -533,6 +548,10 @@ def parse_arguments():
     parser.add_argument("--max_concepts", default=None, type=int,
                         help="Limit number of concepts to process (for debugging)")
     parser.add_argument("--seed", default=42, type=int, help="Random seed")
+    parser.add_argument("--images_per_concept", default=4, type=int,
+                        help="Number of images to generate per concept (default: 4)")
+    parser.add_argument("--start_from", default=None, type=str,
+                        help="concept_id to start from (skip all concepts before it), e.g. 'plushie_happysad'")
     return parser.parse_args()
 
 
@@ -583,6 +602,8 @@ def main():
             sft=sft,
             max_gen_len=args.max_gen_len,
             max_concepts=args.max_concepts,
+            images_per_concept=args.images_per_concept,
+            start_from=args.start_from,   # ← 传入
         )
 
     # Run multi-concept evaluation
@@ -602,6 +623,7 @@ def main():
             sft=sft,
             max_gen_len=args.max_gen_len,
             max_concepts=args.max_concepts,
+            images_per_concept=args.images_per_concept,
         )
 
     print("\nDone! Results saved to:", os.path.join(args.save_dir, "results", f"{args.save_name}.json"))
