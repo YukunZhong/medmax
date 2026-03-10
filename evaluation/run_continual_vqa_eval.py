@@ -65,7 +65,7 @@ from evaluation.continual_metrics import (
 # ──────────────────────────────────────────────────────────────────────
 # Default task configuration
 # ──────────────────────────────────────────────────────────────────────
-TASK_ORDER = ["scienceqa", "textvqa", "gqa"]
+TASK_ORDER = ["scienceqa", "imagenet", "gqa"]
 
 # Tasks whose test sets have NO ground-truth labels.
 # For these tasks we skip accuracy computation and instead save an
@@ -78,14 +78,14 @@ SUBMISSION_ONLY_TASKS = {"textvqa"}
 #   Chameleon: {model_base_dir}/seqlora_{task}/seqlora_{task}_stage3/
 TASK_DIR_NAMES = {
     "scienceqa": "scienceqa",
-    "textvqa":   "textvqa",
+    "imagenet":  "imagenet",
     "gqa":       "gqa",
 }
 
 # Instruction names in MoDE-official/instructions/
 TASK_INSTRUCTION_NAMES = {
     "scienceqa": "ScienceQA",
-    "textvqa":   "TextVQA",
+    "imagenet":  "ImageNet",
     "gqa":       "GQA",
 }
 
@@ -94,7 +94,7 @@ TASK_INSTRUCTION_NAMES = {
 # Fallback: data/{Name}/val_data.jsonl   (for tasks where test.json lacks answers)
 TEST_DATA_PATHS = {
     "scienceqa": "instructions/ScienceQA/test.json",
-    "textvqa":   "instructions/TextVQA/test.json",
+    "imagenet":  "instructions/ImageNet/test.json",
     "gqa":       "instructions/GQA/test.json",
 }
 
@@ -106,7 +106,7 @@ TEST_DATA_FALLBACK = {
 # Maximum generation length for each task
 MAX_GEN_LEN = {
     "scienceqa": 5,    # letter answer (A/B/C/D)
-    "textvqa":   20,   # short phrase
+    "imagenet":  30,   # short phrase
     "gqa":       20,   # short phrase
 }
 
