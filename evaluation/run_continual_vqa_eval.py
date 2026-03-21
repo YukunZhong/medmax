@@ -65,21 +65,14 @@ from evaluation.continual_metrics import (
 # ──────────────────────────────────────────────────────────────────────
 # Default task configuration
 # ──────────────────────────────────────────────────────────────────────
-TASK_ORDER = ["scienceqa", "imagenet", "gqa"]
+DEFAULT_TASK_ORDER = ["scienceqa", "imagenet", "gqa"]
 
-# Tasks whose test sets have NO ground-truth labels.
-# For these tasks we skip accuracy computation and instead save an
-# EvalAI-compatible submission JSON: [{"question_id": ..., "answer": ...}]
-SUBMISSION_ONLY_TASKS = {"textvqa"}
-
-# Maps task key -> (directory_name, display_name_in_instructions)
-# Directory layout:
-#   HF:        {model_base_dir}/seqlora_{task}/seqlora_{task}_stage2/
-#   Chameleon: {model_base_dir}/seqlora_{task}/seqlora_{task}_stage3/
 TASK_DIR_NAMES = {
     "scienceqa": "scienceqa",
     "imagenet":  "imagenet",
     "gqa":       "gqa",
+    "textvqa":   "textvqa",
+    "vizwiz":    "vizwiz",
 }
 
 # Instruction names in MoDE-official/instructions/
@@ -87,20 +80,19 @@ TASK_INSTRUCTION_NAMES = {
     "scienceqa": "ScienceQA",
     "imagenet":  "ImageNet",
     "gqa":       "GQA",
+    "textvqa":   "TextVQA",
+    "vizwiz":    "VizWiz",
 }
 
 # Test data files (relative to data_base_dir)
-# Primary: instructions/{Name}/test.json (all tasks)
-# Fallback: data/{Name}/val_data.jsonl   (for tasks where test.json lacks answers)
+# For ScienceQA/ImageNet/GQA: use instructions/ test.json (has labels)
+# For TextVQA/VizWiz: use data/ test_data.jsonl (repurposed val set with labels)
 TEST_DATA_PATHS = {
     "scienceqa": "instructions/ScienceQA/test.json",
     "imagenet":  "instructions/ImageNet/test.json",
     "gqa":       "instructions/GQA/test.json",
-}
-
-# Fallback test data (used when primary test.json has no ground-truth answers)
-TEST_DATA_FALLBACK = {
-    "textvqa":   "data/TextVQA/val_data.jsonl",
+    "textvqa":   "data/TextVQA/test_data.jsonl",
+    "vizwiz":    "data/VizWiz/test_data.jsonl",
 }
 
 # Maximum generation length for each task
@@ -108,6 +100,8 @@ MAX_GEN_LEN = {
     "scienceqa": 5,    # letter answer (A/B/C/D)
     "imagenet":  30,   # short phrase
     "gqa":       20,   # short phrase
+    "textvqa":   20,   # short phrase
+    "vizwiz":    20,   # short phrase
 }
 
 
@@ -122,41 +116,9 @@ def get_model_path(model_base_dir: str, task: str, model_format: str) -> str:
     )
 
 
-def get_test_data_path(data_base_dir: str, task: str, for_submission: bool = False) -> str:
-    """Resolve the test data path.
-
-    When ``for_submission=True`` (submission-only task, no ground-truth labels)
-    always return the primary instructions test.json – never fall back to a
-    labelled validation set.
-    """
-    primary = os.path.join(data_base_dir, TEST_DATA_PATHS[task])
-
-    if for_submission:
-        return primary
-
-    # Quick check: does primary file have answer keys?
-    if os.path.isfile(primary):
-        try:
-            with open(primary, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, list) and len(data) > 0:
-                has_answers = any(
-                    item.get("answer") for item in data[:10]
-                )
-                if has_answers:
-                    return primary
-        except Exception:
-            pass
-
-    # Try fallback
-    if task in TEST_DATA_FALLBACK:
-        fallback = os.path.join(data_base_dir, TEST_DATA_FALLBACK[task])
-        if os.path.isfile(fallback):
-            print(f"  [{task}] test.json has no answers, using fallback: {fallback}")
-            return fallback
-
-    # Return primary anyway (will skip entries without answers)
-    return primary
+def get_test_data_path(data_base_dir: str, task: str) -> str:
+    """Resolve the test data path for a given task."""
+    return os.path.join(data_base_dir, TEST_DATA_PATHS[task])
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -175,14 +137,10 @@ def load_test_data(
     data_path: str,
     image_base_dir: str,
     task_name: str,
-    require_answer: bool = True,
 ) -> List[Dict[str, Any]]:
     """
     Load test samples from either a JSON array file or JSONL file.
     Returns list of dicts with keys: question_id, text, answer, image (abs path or None).
-
-    When ``require_answer=False`` samples without ground-truth answers are
-    included (used for submission-only tasks such as TextVQA test set).
     """
     samples: List[Dict[str, Any]] = []
 
@@ -222,7 +180,7 @@ def load_test_data(
             data = json.load(f)
         for obj in data:
             answer = obj.get("answer", "")
-            if require_answer and not answer:
+            if not answer:
                 continue  # skip samples without ground-truth
             raw_img = obj.get("image", "")
             if raw_img:
@@ -405,7 +363,7 @@ def run_continual_eval(args) -> Dict[str, Any]:
       3. Record accuracy in matrix[i][j]
     Finally compute ACC and Fgt.
     """
-    tasks = TASK_ORDER
+    tasks = args.task_order if hasattr(args, 'task_order') and args.task_order else DEFAULT_TASK_ORDER
     num_tasks = len(tasks)
 
     # Resolve paths
@@ -423,10 +381,9 @@ def run_continual_eval(args) -> Dict[str, Any]:
     print("=" * 60)
     test_data: Dict[str, List[Dict[str, Any]]] = {}
     for task in tasks:
-        is_submission = task in SUBMISSION_ONLY_TASKS
-        test_path = get_test_data_path(data_base, task, for_submission=is_submission)
+        test_path = get_test_data_path(data_base, task)
         test_data[task] = load_test_data(
-            test_path, image_base, task, require_answer=not is_submission
+            test_path, image_base, task
         )
 
     # Iterate over stages
@@ -478,22 +435,11 @@ def run_continual_eval(args) -> Dict[str, Any]:
             pred_dir = os.path.join(output_dir, f"stage{stage}_predictions")
             os.makedirs(pred_dir, exist_ok=True)
 
-            if eval_task in SUBMISSION_ONLY_TASKS:
-                # No ground-truth labels – save EvalAI submission JSON and skip accuracy.
-                submission = [
-                    {"question_id": p["question_id"], "answer": p["prediction"]}
-                    for p in predictions
-                ]
-                sub_path = os.path.join(pred_dir, f"{eval_task}_evalai_submission.json")
-                save_json(sub_path, submission)
-                stage_results[eval_task] = None  # no label, accuracy unknown
-                print(f"    -> {eval_task}: no labels – {len(submission)} predictions saved to {sub_path}")
-            else:
-                acc, detailed = compute_task_accuracy(predictions)
-                stage_results[eval_task] = acc
-                print(f"    -> {eval_task} accuracy: {acc:.4f}  ({sum(d['correct'] for d in detailed)}/{len(detailed)})")
-                pred_path = os.path.join(pred_dir, f"{eval_task}_predictions.json")
-                save_json(pred_path, detailed)
+            acc, detailed = compute_task_accuracy(predictions)
+            stage_results[eval_task] = acc
+            print(f"    -> {eval_task} accuracy: {acc:.4f}  ({sum(d['correct'] for d in detailed)}/{len(detailed)})")
+            pred_path = os.path.join(pred_dir, f"{eval_task}_predictions.json")
+            save_json(pred_path, detailed)
 
         # Update accuracy matrix
         matrix_data = update_accuracy_matrix(matrix_path, stage, tasks, stage_results)
@@ -522,24 +468,18 @@ def run_continual_eval(args) -> Dict[str, Any]:
     # Print accuracy matrix
     print(format_matrix(tasks, matrix))
 
-    # Final ACC, Fgt and BWT (submission-only tasks with None accuracy are excluded)
+    # Final ACC, Fgt and BWT
     acc, fgt = compute_acc_fgt(matrix)
     bwt = compute_bwt(matrix)
-    labelled_tasks = [t for t in tasks if t not in SUBMISSION_ONLY_TASKS]
-    submission_tasks = [t for t in tasks if t in SUBMISSION_ONLY_TASKS]
-    if submission_tasks:
-        print(f"  Note: {submission_tasks} are submission-only (no labels); excluded from ACC/Fgt/BWT.")
-    print(f"\nFinal ACC (average accuracy after last stage, labelled tasks): {acc:.4f}")
-    print(f"Final Fgt (average forgetting):                                {fgt:.4f}")
-    print(f"Final BWT (backward transfer):                                 {bwt:.4f}")
+    print(f"\nFinal ACC (average accuracy after last stage): {acc:.4f}")
+    print(f"Final Fgt (average forgetting):                 {fgt:.4f}")
+    print(f"Final BWT (backward transfer):                  {bwt:.4f}")
 
     # Per-stage metrics
     print("\nPer-stage breakdown:")
     for s in range(1, num_tasks + 1):
         acc_s, fgt_s = compute_stage_acc_fgt(matrix, s)
-        task_at_stage = tasks[s - 1]
-        note = " (excl. submission-only)" if task_at_stage in SUBMISSION_ONLY_TASKS else ""
-        print(f"  Stage {s}: ACC={acc_s:.4f}, Fgt={fgt_s:.4f}{note}")
+        print(f"  Stage {s}: ACC={acc_s:.4f}, Fgt={fgt_s:.4f}")
 
     # Save summary
     summary = {
@@ -624,6 +564,12 @@ def parse_arguments() -> argparse.Namespace:
         type=int,
         default=0,
         help="Max samples per task for debugging (0 = all samples)",
+    )
+    parser.add_argument(
+        "--task_order",
+        nargs="+",
+        default=None,
+        help="Ordered list of tasks, e.g. scienceqa textvqa vizwiz (default: scienceqa imagenet gqa)",
     )
     return parser.parse_args()
 
