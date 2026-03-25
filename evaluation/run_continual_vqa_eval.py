@@ -105,14 +105,25 @@ MAX_GEN_LEN = {
 }
 
 
-def get_model_path(model_base_dir: str, task: str, model_format: str) -> str:
-    """Build model checkpoint path for a given task and format."""
+def get_model_path(
+    model_base_dir: str,
+    task: str,
+    model_format: str,
+    ckpt_prefix: str = "seqlora",
+) -> str:
+    """Build model checkpoint path for a given task and format.
+
+    ckpt_prefix="seqlora" (default) → seqlora_{task}/seqlora_{task}_stage{2|3}
+    ckpt_prefix="mode"              → mode_{task}/hf_model
+    """
     dirname = TASK_DIR_NAMES[task]
+    if ckpt_prefix == "mode":
+        return os.path.join(model_base_dir, f"mode_{dirname}")
     stage = "stage3" if model_format == "chameleon" else "stage2"
     return os.path.join(
         model_base_dir,
-        f"seqlora_{dirname}",
-        f"seqlora_{dirname}_{stage}",
+        f"{ckpt_prefix}_{dirname}",
+        f"{ckpt_prefix}_{dirname}_{stage}",
     )
 
 
@@ -225,6 +236,61 @@ def load_model_hf(model_dir: str, processor_dir: str):
         device_map="auto",
     )
     model.eval()
+    processor = ChameleonProcessor.from_pretrained(processor_dir)
+    return model, processor
+
+
+def load_model_mode(
+    adapter_dir: str,
+    base_model_dir: str,
+    processor_dir: str,
+    lora_rank: int = 8,
+    lora_alpha: int = 16,
+    num_experts: int = 4,
+):
+    """Load base Anole model, insert MoDE adapters, load adapter weights.
+
+    MoDE saves adapters as mode_adapters.pt (only trainable params).
+    The base backbone weights come from the original Anole checkpoint.
+    A forward pre-hook auto-sets image_mask from input_ids on every call
+    (including each step of generate()).
+    """
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from transformers import ChameleonForConditionalGeneration, ChameleonProcessor
+    from training.mode_adapters import insert_mode_adapters, build_image_mask
+    from training.mode_train import load_adapters
+
+    adapter_path = os.path.join(adapter_dir, "mode_adapters.pt")
+    print(f"  Loading base model from {base_model_dir} ...")
+    print(f"  Loading MoDE adapters from {adapter_path} ...")
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = ChameleonForConditionalGeneration.from_pretrained(
+        base_model_dir,
+        torch_dtype=torch.bfloat16,
+    )
+    model.to(device)
+
+    mode_context = insert_mode_adapters(
+        model, lora_rank=lora_rank, lora_alpha=lora_alpha, num_experts=num_experts,
+    )
+    load_adapters(model, adapter_path, device)
+    model.eval()
+    model.mode = "inference-text"
+    mode_context["kd_mode"] = False
+
+    def _auto_set_image_mask(module, args, kwargs):
+        """Pre-hook: derive image_mask from input_ids before each forward."""
+        input_ids = kwargs.get("input_ids")
+        if input_ids is None and len(args) > 0:
+            input_ids = args[0]
+        if input_ids is not None:
+            mode_context["image_mask"] = build_image_mask(input_ids)
+        else:
+            mode_context["image_mask"] = None
+
+    model.register_forward_pre_hook(_auto_set_image_mask, with_kwargs=True)
+
     processor = ChameleonProcessor.from_pretrained(processor_dir)
     return model, processor
 
@@ -392,7 +458,8 @@ def run_continual_eval(args) -> Dict[str, Any]:
     for stage_idx in range(num_tasks):
         stage = stage_idx + 1  # 1-based
         current_task = tasks[stage_idx]
-        model_dir = get_model_path(model_base, current_task, args.model_format)
+        model_dir = get_model_path(model_base, current_task, args.model_format,
+                                   ckpt_prefix=args.ckpt_prefix)
 
         print()
         print("=" * 60)
@@ -406,6 +473,16 @@ def run_continual_eval(args) -> Dict[str, Any]:
         processor_obj = None
         if args.model_format == "chameleon":
             model_obj = load_model_chameleon(model_dir)
+        elif args.ckpt_prefix == "mode":
+            processor_dir = args.processor_dir or args.hf_base_model_dir
+            model_obj, processor_obj = load_model_mode(
+                adapter_dir=model_dir,
+                base_model_dir=args.hf_base_model_dir,
+                processor_dir=processor_dir,
+                lora_rank=args.mode_lora_rank,
+                lora_alpha=args.mode_lora_alpha,
+                num_experts=args.mode_num_experts,
+            )
         else:
             processor_dir = args.processor_dir or args.hf_base_model_dir
             model_obj, processor_obj = load_model_hf(model_dir, processor_dir)
@@ -571,6 +648,19 @@ def parse_arguments() -> argparse.Namespace:
         default=None,
         help="Ordered list of tasks, e.g. scienceqa textvqa vizwiz (default: scienceqa imagenet gqa)",
     )
+    parser.add_argument(
+        "--ckpt_prefix",
+        type=str,
+        default="seqlora",
+        help=(
+            "Checkpoint directory prefix. "
+            "'seqlora' (default): {base}/seqlora_{task}/seqlora_{task}_stage{2|3}. "
+            "'mode': {base}/mode_{task}/ (loads base model + adapter weights)."
+        ),
+    )
+    parser.add_argument("--mode_lora_rank",   type=int, default=8,  help="MoDE LoRA rank (must match training)")
+    parser.add_argument("--mode_lora_alpha",  type=int, default=16, help="MoDE LoRA alpha (must match training)")
+    parser.add_argument("--mode_num_experts", type=int, default=4,  help="MoDE num experts (must match training)")
     return parser.parse_args()
 
 

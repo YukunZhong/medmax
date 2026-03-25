@@ -26,18 +26,21 @@ def collate_fn(batch):
     ## padding value = 1 since tokenizer.pad_token_id = 1 for Chameleon/Anole
     batch_inputs_padded = pad_sequence(batch_inputs, batch_first=True, padding_value=1)
 
-    labels = batch_inputs.copy()
-    location_sep = (labels[0] == 8710).nonzero()
-    ## if there are pad tokens
-    if len(location_sep) != 0:
-        new_labels = []
-        for i in range(len(labels)):
-            label = labels[i]
-            loc_sep = (label == 8710).nonzero()[0]
-            new_label = torch.cat([torch.tensor([-100] * (loc_sep+1)), label[loc_sep+1:]], dim = -1)
-            new_labels.append(new_label)
-        labels = new_labels
-    labels = pad_sequence(labels, batch_first=True, padding_value=-100)
+    ## Build per-sample labels: mask everything up to and including the separator token
+    ## (8710 = <reserved08706>) with -100 so loss is only computed on the answer tokens.
+    ## Samples without a separator (e.g. eval-only data) keep all tokens as labels.
+    new_labels = []
+    for label in batch_inputs:
+        sep_positions = (label == 8710).nonzero()
+        if len(sep_positions) != 0:
+            loc_sep = sep_positions[0]
+            new_label = torch.cat(
+                [torch.tensor([-100] * (loc_sep + 1)), label[loc_sep + 1:]], dim=-1
+            )
+        else:
+            new_label = label.clone()
+        new_labels.append(new_label)
+    labels = pad_sequence(new_labels, batch_first=True, padding_value=-100)
 
     # Create attention masks
     attention_masks = torch.zeros_like(batch_inputs_padded, dtype=torch.long)
