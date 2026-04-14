@@ -50,6 +50,8 @@ from transformers import ChameleonForConditionalGeneration, get_cosine_schedule_
 from .mode_adapters import (
     MoDEChameleonMLP,
     build_image_mask,
+    compute_lce_gamma,
+    compute_stable_rank_gamma,
     get_adapter_param_groups,
     insert_mode_adapters,
 )
@@ -252,6 +254,80 @@ def load_adapters(model: nn.Module, adapter_path: str, device: torch.device) -> 
 
 
 # ===========================================================================
+# LCE bucket boundary computation
+# ===========================================================================
+
+def _instruction_length(tokens: List[int]) -> int:
+    """Count instruction text tokens (before first SEP, no image/PAD/BOS)."""
+    sep_pos = len(tokens)
+    for i, t in enumerate(tokens):
+        if t == SEP_TOKEN_ID:
+            sep_pos = i
+            break
+    count = 0
+    for t in tokens[:sep_pos]:
+        if t == PAD_TOKEN_ID or t == BOS_TOKEN_ID:
+            continue
+        if IMAGE_TOKEN_MIN <= t <= IMAGE_TOKEN_MAX:
+            continue
+        count += 1
+    return count
+
+
+def compute_bucket_boundaries(
+    data_dir: str,
+    task_dirs: List[str],
+    train_file: str = "train_data.jsonl",
+    num_buckets: int = 4,
+    max_length: int = 2048,
+) -> List[int]:
+    """Compute LCE bucket boundaries from training data instruction lengths.
+
+    Scans all task training files, measures instruction text token length for
+    every sample, then returns (num_buckets - 1) quantile values that split
+    the distribution into ``num_buckets`` equal-frequency bins.
+
+    For the default num_buckets=4 (short / medium / long / xlong) this
+    returns [Q25, Q50, Q75] of the instruction-length distribution.
+
+    Returns:
+        Sorted list of (num_buckets - 1) integer boundary values.
+    """
+    lengths: List[int] = []
+    for task_dir in task_dirs:
+        fpath = os.path.join(data_dir, task_dir, train_file)
+        if not os.path.exists(fpath):
+            continue
+        with jsonlines.open(fpath) as reader:
+            for obj in reader:
+                tokens = obj.get("tokens", [])
+                if isinstance(tokens, str):
+                    tokens = json.loads(tokens)
+                tokens = tokens[:max_length]
+                lengths.append(_instruction_length(tokens))
+
+    if not lengths:
+        raise ValueError(
+            "No training samples found — cannot compute bucket boundaries. "
+            f"Looked in: {[os.path.join(data_dir, d) for d in task_dirs]}"
+        )
+
+    lengths_t = torch.tensor(lengths, dtype=torch.float32)
+    qs = torch.linspace(0.0, 1.0, num_buckets + 1)[1:-1]  # (num_buckets-1) quantiles
+    boundaries = [int(torch.quantile(lengths_t, q.item()).item()) for q in qs]
+
+    # Deduplicate and sort (can happen if distribution is very concentrated)
+    boundaries = sorted(set(boundaries))
+    if len(boundaries) < num_buckets - 1:
+        # Pad with values beyond max to fill remaining slots
+        max_len = int(lengths_t.max().item()) + 1
+        while len(boundaries) < num_buckets - 1:
+            boundaries.append(max_len + len(boundaries))
+
+    return boundaries
+
+
+# ===========================================================================
 # Training helpers
 # ===========================================================================
 
@@ -295,7 +371,16 @@ def train_one_task(
     grad_acc: int,
     log_steps: int,
     is_main: bool = True,
+    use_gate: bool = False,
+    bucket_boundaries: Optional[torch.Tensor] = None,
+    teacher_device: Optional[torch.device] = None,
+    use_bilce: bool = False,
+    bilce_short_rank: Optional[int] = None,
+    bilce_long_rank: Optional[int] = None,
 ) -> None:
+    # When teacher_device is not set, it lives on the same device as the student
+    if teacher_device is None:
+        teacher_device = device
     student.train()
     teacher.eval()
 
@@ -319,6 +404,31 @@ def train_one_task(
         # ================================================================
         # 1. CE Loss  — both T-MoE and V-Adapter receive gradients
         # ================================================================
+
+        # LCE/BiLCE gate: compute sample-level γ before forward
+        if use_bilce and bilce_short_rank is not None:
+            gamma = compute_stable_rank_gamma(
+                raw_student, input_ids,
+                short_rank=bilce_short_rank,
+                long_rank=bilce_long_rank,
+                sep_token_id=SEP_TOKEN_ID,
+                pad_token_id=PAD_TOKEN_ID,
+                bos_token_id=BOS_TOKEN_ID,
+                instruction_only=True,
+            )
+            mode_context["gamma"] = gamma
+        elif use_gate and bucket_boundaries is not None:
+            gamma = compute_lce_gamma(
+                raw_student, input_ids, bucket_boundaries,
+                sep_token_id=SEP_TOKEN_ID,
+                pad_token_id=PAD_TOKEN_ID,
+                bos_token_id=BOS_TOKEN_ID,
+                instruction_only=True,
+            )
+            mode_context["gamma"] = gamma
+        else:
+            mode_context["gamma"] = None
+
         mode_context["image_mask"] = vqa_img_mask
         mode_context["kd_mode"]    = False
         raw_student.mode = "train-text"
@@ -336,23 +446,28 @@ def train_one_task(
         #               means T-MoE branch is skipped in every MLP layer)
         # ================================================================
         laion_batch = next(laion_iter)
-        laion_ids   = laion_batch["input_ids"].to(device)        # [B_kd, S_kd]
+        # Send laion ids to teacher device for teacher forward
+        laion_ids_teacher = laion_batch["input_ids"].to(teacher_device)
+        # Send laion ids to student device for student forward + KD loss
+        laion_ids_student = laion_batch["input_ids"].to(device)
 
-        laion_img_mask = build_image_mask(laion_ids)
+        laion_img_mask = build_image_mask(laion_ids_student)
 
         with torch.no_grad():
             teacher.mode = "train-all"
-            t_out       = teacher(input_ids=laion_ids)
-            t_logits    = t_out.logits                           # [B_kd, S_kd, V]
+            t_out    = teacher(input_ids=laion_ids_teacher)
+            # Move teacher logits to student device before computing KD loss
+            t_logits = t_out.logits.to(device)                  # [B_kd, S_kd, V]
 
         mode_context["image_mask"] = laion_img_mask
         mode_context["kd_mode"]    = True
+        mode_context["gamma"]      = None   # γ unused when kd_mode skips T-MoE
         raw_student.mode = "train-all"
 
-        s_out    = student(input_ids=laion_ids)
+        s_out    = student(input_ids=laion_ids_student)
         s_logits = s_out.logits                                  # [B_kd, S_kd, V]
 
-        L_kd = compute_kd_loss(s_logits, t_logits, laion_ids, beta=beta_kd)
+        L_kd = compute_kd_loss(s_logits, t_logits, laion_ids_student, beta=beta_kd)
         (lambda_kd * L_kd / grad_acc).backward()
 
         # ================================================================
@@ -440,6 +555,42 @@ def parse_args():
     p.add_argument("--max_length",  type=int,   default=2048)
     p.add_argument("--log_steps",   type=int,   default=50)
 
+    # LCE-LoRA
+    p.add_argument("--use_lce", action="store_true",
+                   help="Replace T-MoE experts with LCE dual-branch LoRA")
+    p.add_argument("--base_rank", type=int, default=6,
+                   help="Rank of the LCE base branch (always active)")
+    p.add_argument("--ext_rank", type=int, default=2,
+                   help="Rank of the LCE extension branch (gated by gamma)")
+
+    # BiLCE-LoRA
+    p.add_argument("--use_bilce", action="store_true",
+                   help="Replace T-MoE experts with BiLCE three-branch LoRA "
+                        "(common + short-private + long-private)")
+    p.add_argument("--common_rank", type=int, default=2,
+                   help="Rank of the BiLCE common branch (always active)")
+    p.add_argument("--short_rank", type=int, default=3,
+                   help="Rank of the BiLCE short-private branch (gated by 1-gamma)")
+    p.add_argument("--long_rank", type=int, default=3,
+                   help="Rank of the BiLCE long-private branch (gated by gamma)")
+
+    # Shared gate args (used by both LCE and BiLCE)
+    p.add_argument("--num_buckets", type=int, default=4,
+                   help="Number of length buckets (short/medium/long/xlong)")
+    p.add_argument("--auto_bucket", action="store_true",
+                   help="Auto-compute bucket boundaries from training data quartiles "
+                        "(recommended; overrides --bucket_boundaries)")
+    p.add_argument("--bucket_boundaries", type=int, nargs="*", default=None,
+                   help="Manual bucket boundaries (K-1 ints). "
+                        "Used only when --auto_bucket is NOT set. "
+                        "Default when omitted: uniform [20,50,100] for K=4.")
+
+    # Split-GPU: load student and teacher on separate GPUs
+    p.add_argument("--student_gpu", type=int, default=None,
+                   help="GPU id for the student model (overrides LOCAL_RANK-based device)")
+    p.add_argument("--teacher_gpu", type=int, default=None,
+                   help="GPU id for the teacher model (may differ from student)")
+
     # Resume
     p.add_argument("--resume_adapter", default=None,
                    help="Path to mode_adapters.pt to resume from")
@@ -464,43 +615,77 @@ def is_main_process(local_rank: int) -> bool:
 def main():
     args = parse_args()
 
+    if args.use_lce and args.use_bilce:
+        raise ValueError("--use_lce and --use_bilce are mutually exclusive; pick one.")
+
     # ── Distributed setup ──────────────────────────────────────────────
     local_rank, world_size = setup_distributed()
-    device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
     is_main = is_main_process(local_rank)
+
+    # ------------------------------------------------------------------
+    # Device assignment
+    # ------------------------------------------------------------------
+    if torch.cuda.is_available():
+        # Split-GPU mode: student and teacher on different cards
+        if args.student_gpu is not None and args.teacher_gpu is not None:
+            student_device  = torch.device(f"cuda:{args.student_gpu}")
+            teacher_device  = torch.device(f"cuda:{args.teacher_gpu}")
+            device = student_device   # default device = student (for data, scheduler, etc.)
+            if world_size > 1:
+                raise ValueError(
+                    "--student_gpu / --teacher_gpu split is not compatible with "
+                    "torchrun multi-GPU (use single-process launch instead)."
+                )
+        else:
+            device = torch.device(f"cuda:{local_rank}")
+            student_device = device
+            teacher_device = device
+    else:
+        device = student_device = teacher_device = torch.device("cpu")
 
     assert len(args.tasks) == len(args.task_dirs), \
         "--tasks and --task_dirs must have the same length"
 
     if is_main:
         os.makedirs(args.output_dir, exist_ok=True)
+        if student_device != teacher_device:
+            print(f"[MoDE] Split-GPU mode: student → {student_device}, teacher → {teacher_device}")
 
     # ------------------------------------------------------------------
     # Load student backbone + insert MoDE adapters
     # ------------------------------------------------------------------
     if is_main:
-        print("[MoDE] Loading student backbone...")
-    student = load_model(args.ckpt, device)
+        print(f"[MoDE] Loading student backbone on {student_device} ...")
+    student = load_model(args.ckpt, student_device)
+    use_gate = args.use_lce or args.use_bilce
     mode_context = insert_mode_adapters(
         student,
         lora_rank=args.lora_rank,
         lora_alpha=args.lora_alpha,
         num_experts=args.num_experts,
+        use_lce=args.use_lce,
+        base_rank=args.base_rank if args.use_lce else None,
+        ext_rank=args.ext_rank if args.use_lce else None,
+        use_bilce=args.use_bilce,
+        common_rank=args.common_rank if args.use_bilce else None,
+        short_rank=args.short_rank if args.use_bilce else None,
+        long_rank=args.long_rank if args.use_bilce else None,
+        num_buckets=args.num_buckets,
     )
 
     if args.resume_adapter:
-        load_adapters(student, args.resume_adapter, device)
+        load_adapters(student, args.resume_adapter, student_device)
 
-    # Wrap with DDP when using multiple GPUs
+    # Wrap with DDP when using multiple GPUs (only when NOT in split-GPU mode)
     if world_size > 1:
         student = DDP(student, device_ids=[local_rank], find_unused_parameters=True)
 
     # ------------------------------------------------------------------
-    # Load frozen teacher (no adapters) — each rank holds its own copy
+    # Load frozen teacher (no adapters)
     # ------------------------------------------------------------------
     if is_main:
-        print("[MoDE] Loading frozen teacher (same checkpoint, no adapters)...")
-    teacher = load_model(args.ckpt, device)
+        print(f"[MoDE] Loading frozen teacher on {teacher_device} ...")
+    teacher = load_model(args.ckpt, teacher_device)
     for p in teacher.parameters():
         p.requires_grad_(False)
     teacher.eval()
@@ -526,6 +711,60 @@ def main():
         num_workers=0,
     )
     laion_iter = cycle(laion_loader)
+
+    # ------------------------------------------------------------------
+    # Gate bucket boundaries (LCE only; BiLCE uses parameter-free
+    # Stable-Rank Prompt Gate and does not need bucket boundaries)
+    # ------------------------------------------------------------------
+    gate_tag = "BiLCE" if args.use_bilce else "LCE"
+    if use_gate and not args.use_bilce:
+        if args.auto_bucket:
+            train_file_name = (
+                "train_data_with_caption.jsonl" if args.use_caption else "train_data.jsonl"
+            )
+            if is_main:
+                print(f"[{gate_tag}] Computing bucket boundaries from training data quartiles…")
+            raw_boundaries = compute_bucket_boundaries(
+                data_dir=args.data_dir,
+                task_dirs=args.task_dirs,
+                train_file=train_file_name,
+                num_buckets=args.num_buckets,
+                max_length=args.max_length,
+            )
+            bucket_json_path = os.path.join(args.output_dir, "lce_bucket_boundaries.json")
+            if is_main:
+                with open(bucket_json_path, "w") as _f:
+                    json.dump(
+                        {
+                            "num_buckets": args.num_buckets,
+                            "boundaries": raw_boundaries,
+                            "labels": ["short", "medium", "long", "xlong"][: args.num_buckets],
+                        },
+                        _f,
+                        indent=2,
+                    )
+                print(f"[{gate_tag}] boundaries saved → {bucket_json_path}")
+        else:
+            raw_boundaries = sorted(args.bucket_boundaries or [20, 50, 100])
+
+        bucket_boundaries = torch.tensor(raw_boundaries, dtype=torch.long, device=device)
+        labels = ["short", "medium", "long", "xlong"][: args.num_buckets]
+        if is_main:
+            for lo, hi, lbl in zip(
+                [0] + raw_boundaries,
+                raw_boundaries + ["∞"],
+                labels,
+            ):
+                print(f"[{gate_tag}]   {lbl:8s}: [{lo}, {hi})")
+    elif args.use_bilce:
+        bucket_boundaries = None
+        r_p = args.short_rank + args.long_rank
+        if is_main:
+            print(f"[BiLCE] Stable-Rank Prompt Gate: r_p = short_rank + long_rank = {r_p}")
+            print(f"[BiLCE]   γ(x) = sr(H̃) / (sr(H̃) + {r_p})")
+            print(f"[BiLCE]   H from frozen layer-0 pre-MLP hidden states")
+    else:
+        bucket_boundaries = None
 
     # ------------------------------------------------------------------
     # Sequential task training
@@ -591,6 +830,12 @@ def main():
                 grad_acc     = args.grad_acc,
                 log_steps    = args.log_steps,
                 is_main      = is_main,
+                use_gate     = use_gate,
+                bucket_boundaries = bucket_boundaries,
+                teacher_device    = teacher_device,
+                use_bilce         = args.use_bilce,
+                bilce_short_rank  = args.short_rank if args.use_bilce else None,
+                bilce_long_rank   = args.long_rank if args.use_bilce else None,
             )
 
         # Only rank-0 saves adapter weights
